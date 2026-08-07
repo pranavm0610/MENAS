@@ -72,11 +72,6 @@ venv.bak/
 *.weights
 checkpoints/
 
-# Data
-PH2Dataset/
-data/
-datasets/
-
 # OS generated files
 .DS_Store
 .DS_Store?

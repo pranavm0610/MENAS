@@ -50,7 +50,11 @@ def compute_metrics(outputs, masks, threshold=0.5):
     union = ((preds == 1) | (masks == 1)).sum().item()
     iou = intersection / union if union > 0 else 1.0
 
-    return accuracy.item(), f1, iou
+    pred_sum = (preds == 1).sum().item()
+    mask_sum = (masks == 1).sum().item()
+    dice = 2 * intersection / (pred_sum + mask_sum) if (pred_sum + mask_sum) > 0 else 1.0
+
+    return accuracy.item(), f1, iou, dice
 
 
 def get_temperature(epoch, num_epochs, tau_start=5.0, tau_end=0.1):
@@ -186,7 +190,26 @@ if __name__ == "__main__":
         'train_acc': [], 'val_acc': [],
         'train_f1': [], 'val_f1': [],
         'train_iou': [], 'val_iou': [],
+        'train_dice': [], 'val_dice': [],
         'kl_loss': [], 'sparsity_loss': [], 'temperature': [],
+    }
+
+    best_val_dice = 0.0
+    model_config = {
+        'n_channels_img': 3,
+        'n_channels_edge': 1,
+        'n_channels_tex': N_TEX_CHANNELS,
+        'n_classes': 1,
+        'gabor_orientations': 4,
+        'gabor_scales': 3,
+        'gabor_kernel_sizes': [5, 9, 13],
+        'gabor_out_channels': GABOR_OUT_CHANNELS,
+    }
+    scatter_config = {
+        'img_size': IMG_SIZE,
+        'n_tex_channels': N_TEX_CHANNELS,
+        'scatter_J': SCATTER_J,
+        'scatter_L': SCATTER_L,
     }
 
     if DEVICE.type == "mps":
@@ -204,6 +227,7 @@ if __name__ == "__main__":
         train_acc = 0
         train_f1 = 0
         train_iou = 0
+        train_dice = 0
         epoch_kl = 0
         epoch_sparsity = 0
 
@@ -238,11 +262,12 @@ if __name__ == "__main__":
             optimizer.step()
 
             # Metrics
-            acc, f1, iou = compute_metrics(outputs, masks)
+            acc, f1, iou, dice = compute_metrics(outputs, masks)
             train_loss += task_loss.item()
             train_acc += acc
             train_f1 += f1
             train_iou += iou
+            train_dice += dice
             epoch_kl += kl_loss.item()
             epoch_sparsity += sparsity_loss.item()
 
@@ -253,6 +278,7 @@ if __name__ == "__main__":
         avg_train_acc = train_acc / n_batches
         avg_train_f1 = train_f1 / n_batches
         avg_train_iou = train_iou / n_batches
+        avg_train_dice = train_dice / n_batches
         history['kl_loss'].append(epoch_kl / n_batches)
         history['sparsity_loss'].append(epoch_sparsity / n_batches)
 
@@ -261,6 +287,7 @@ if __name__ == "__main__":
         val_acc = 0
         val_f1 = 0
         val_iou = 0
+        val_dice = 0
 
         with torch.no_grad():
             val_loop = tqdm(val_loader, desc=f'Epoch [{epoch+1}/{NUM_EPOCHS}] Validation')
@@ -278,11 +305,12 @@ if __name__ == "__main__":
                 focal = focal_criterion(probs, masks)
                 loss = dice + 0.2 * focal
 
-                acc, f1, iou = compute_metrics(outputs, masks)
+                acc, f1, iou, dice = compute_metrics(outputs, masks)
                 val_loss += loss.item()
                 val_acc += acc
                 val_f1 += f1
                 val_iou += iou
+                val_dice += dice
 
                 val_loop.set_postfix(loss=loss.item(), acc=acc, f1=f1)
 
@@ -290,10 +318,11 @@ if __name__ == "__main__":
         avg_val_acc = val_acc / len(val_loader)
         avg_val_f1 = val_f1 / len(val_loader)
         avg_val_iou = val_iou / len(val_loader)
+        avg_val_dice = val_dice / len(val_loader)
 
         print(f'Epoch [{epoch+1}/{NUM_EPOCHS}] '
-              f'Train Loss: {avg_train_loss:.4f}, Acc: {avg_train_acc:.4f}, F1: {avg_train_f1:.4f} | '
-              f'Val Loss: {avg_val_loss:.4f}, Acc: {avg_val_acc:.4f}, F1: {avg_val_f1:.4f} | '
+              f'Train Loss: {avg_train_loss:.4f}, Acc: {avg_train_acc:.4f}, F1: {avg_train_f1:.4f}, Dice: {avg_train_dice:.4f} | '
+              f'Val Loss: {avg_val_loss:.4f}, Acc: {avg_val_acc:.4f}, F1: {avg_val_f1:.4f}, Dice: {avg_val_dice:.4f} | '
               f'τ={temperature:.3f} β={beta:.4f}')
 
         # Store history
@@ -305,6 +334,27 @@ if __name__ == "__main__":
         history['val_f1'].append(avg_val_f1)
         history['train_iou'].append(avg_train_iou)
         history['val_iou'].append(avg_val_iou)
+        history['train_dice'].append(avg_train_dice)
+        history['val_dice'].append(avg_val_dice)
+
+        if avg_val_dice > best_val_dice:
+            best_val_dice = avg_val_dice
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'metrics': {
+                    'accuracy': avg_val_acc,
+                    'f1': avg_val_f1,
+                    'iou': avg_val_iou,
+                    'dice': avg_val_dice,
+                },
+                'model_config': model_config,
+                'scatter_config': scatter_config,
+            }
+            os.makedirs('models', exist_ok=True)
+            torch.save(checkpoint, 'models/best_model.pth')
+            print(f'  Best model saved (Dice: {avg_val_dice:.4f})')
 
         # Log architecture + Gabor params periodically
         if (epoch + 1) % LOG_ARCH_EVERY == 0 or epoch == 0:
@@ -316,8 +366,9 @@ if __name__ == "__main__":
     end_time = time.time()
 
     print("\nTraining complete!")
-    print(f"Final Training Accuracy: {avg_train_acc:.4f}, F1 Score: {avg_train_f1:.4f}")
-    print(f"Final Validation Accuracy: {avg_val_acc:.4f}, F1 Score: {avg_val_f1:.4f}")
+    print(f"Final Training — Acc: {avg_train_acc:.4f}, F1: {avg_train_f1:.4f}, IoU: {avg_train_iou:.4f}, Dice: {avg_train_dice:.4f}")
+    print(f"Final Validation — Acc: {avg_val_acc:.4f}, F1: {avg_val_f1:.4f}, IoU: {avg_val_iou:.4f}, Dice: {avg_val_dice:.4f}")
+    print(f"Best Validation Dice: {best_val_dice:.4f}")
     print(f"Total Training Time: {(end_time - start_time)/60:.2f} minutes")
 
     epochs_range = range(1, NUM_EPOCHS + 1)
@@ -432,6 +483,20 @@ if __name__ == "__main__":
     plt.savefig('training_results_nas_v2.png', dpi=150)
     print("Training plot saved to training_results_nas_v2.png")
 
-    # Save model
-    torch.save(model.state_dict(), 'model_nas_v2.pth')
-    print("Model saved to model_nas_v2.pth")
+    # Save final model checkpoint
+    final_checkpoint = {
+        'epoch': NUM_EPOCHS,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'metrics': {
+            'accuracy': avg_val_acc,
+            'f1': avg_val_f1,
+            'iou': avg_val_iou,
+            'dice': avg_val_dice,
+        },
+        'model_config': model_config,
+        'scatter_config': scatter_config,
+    }
+    torch.save(final_checkpoint, 'model_nas_v2.pth')
+    print("Final model saved to model_nas_v2.pth")
+    print(f"Best model checkpoint at models/best_model.pth (Dice: {best_val_dice:.4f})")

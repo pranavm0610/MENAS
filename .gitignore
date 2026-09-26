@@ -81,5 +81,8 @@ checkpoints/
 ehthumbs.db
 Thumbs.db
 
+# Draw.io diagrams
+*.drawio
+
 # Output
 training_results_nas_v2.png
